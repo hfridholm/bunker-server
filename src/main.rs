@@ -25,7 +25,7 @@ struct Request {
   message: Option<String>,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 struct Response {
   action:  String,
   user:    Option<String>,
@@ -61,21 +61,13 @@ fn start_writer(mut stream: TcpStream, rx: std::sync::mpsc::Receiver<Response>) 
 /*
  *
  */
-fn broadcast(client_id: u64, message: &str, clients: &Clients) -> io::Result<()> {
+fn broadcast(client_id: u64, clients: &Clients, response: Response) -> io::Result<()> {
   let clients = clients.lock().unwrap();
 
-  let sender_name = clients
-    .iter()
-    .find(|c| c.id == client_id)
-    .map(|c| c.name.clone())
-    .unwrap_or_else(|| "unknown".to_string());
-
   for c in clients.iter() {
-    let _ = c.tx.send(Response {
-      action:  "message".to_string(),
-      user:    Some(sender_name.clone()),
-      message: Some(message.to_string()),
-    });
+    if c.id != client_id {
+      let _ = c.tx.send(response.clone());
+    }
   }
 
   Ok(())
@@ -148,24 +140,67 @@ fn handle_client(stream: TcpStream, clients: Clients) -> io::Result<()> {
     locked.push(client);
   }
 
-  println!("{} connected", name);
+  let sender_name = {
+    let locked = clients.lock().unwrap();
+    locked
+      .iter()
+      .find(|c| c.id == client_id)
+      .map(|c| c.name.clone())
+      .unwrap_or_else(|| "unknown".to_string())
+  };
+
+  {
+    let msg: String = format!("{} has connected", sender_name.clone());
+
+    println!("{}", msg);
+
+    broadcast(client_id, &clients, Response {
+      action:  "info".to_string(),
+      user:    None,
+      message: Some(msg.to_string()),
+    });
+  }
 
   // ===== main read loop =====
   loop {
-    let request: Request = recv(&mut reader)?;
+    match recv::<Request>(&mut reader) {
+      Ok(request) => {
+        println!("{:?}", request);
 
-    println!("{:?}", request);
-
-    match request.action.as_str() {
-      "message" => {
-        if let Some(msg) = request.message {
-          broadcast(client_id, &msg, &clients);
+        match request.action.as_str() {
+          "message" => {
+            if let Some(msg) = request.message {
+              broadcast(client_id, &clients, Response {
+                action:  "message".to_string(),
+                user:    Some(sender_name.clone()),
+                message: Some(msg.to_string()),
+              });
+            }
+          },
+          _ => println!("Unknown action: {}", request.action),
         }
       }
+      Err(e) => {
+        eprintln!("Receive error: {}", e);
 
-      _ => println!("Unknown action: {}", request.action),
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+          let msg: String = format!("{} has disconnected", sender_name.clone());
+
+          println!("{}", msg);
+
+          broadcast(client_id, &clients, Response {
+            action:  "info".to_string(),
+            user:    None,
+            message: Some(msg.to_string()),
+          });
+          break;
+        }
+
+        return Err(e);
+      }
     }
   }
+  Ok(())
 }
 
 /*
@@ -173,23 +208,19 @@ fn handle_client(stream: TcpStream, clients: Clients) -> io::Result<()> {
  */
 fn main() -> io::Result<()> {
   let listener = TcpListener::bind("127.0.0.1:7878")?;
-  println!("Chat server running on 127.0.0.1:7878");
+  println!("Server running on 127.0.0.1:7878");
 
   let clients: Clients = Arc::new(Mutex::new(Vec::new()));
 
   for stream in listener.incoming() {
     match stream {
       Ok(stream) => {
-        let peer_addr = stream.peer_addr()?;
-        println!("Client connected: {peer_addr}");
-
         let clients_clone = Arc::clone(&clients);
 
         thread::spawn(move || {
           if let Err(e) = handle_client(stream, clients_clone) {
-            eprintln!("Client {peer_addr} error: {e}");
+            eprintln!("Client error: {e}");
           } else {
-            println!("Client {peer_addr} disconnected");
           }
         });
       }
